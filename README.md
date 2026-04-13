@@ -1,4 +1,4 @@
-# SeasonTowerDefenseSnippet
+# Season Tower Defense Snippet
 Some parts of the code I've written in Season Tower Defense, all rights correspond to RealManMun.
 
 ## This was a year-long project, with some of my friends helping with assets, animations and such.
