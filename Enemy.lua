@@ -18,6 +18,7 @@ Enemy.FinalBossName = "IceboundKrampus"
 Enemy.MarkedBosses = {}
 
 --// Types
+--// Full enemy state definition - every field an enemy instance carries through its lifecycle
 type EnemyData = {
 	Name: string,
 	UniqueId: string,
@@ -28,8 +29,8 @@ type EnemyData = {
 	SpawnTime: number,
 	ParentSpawnTime: number | nil,
 
-	FixedElapsed: number,
-	ElapsedDelay: number,
+	FixedElapsed: number,       -- snapshot of elapsed time when frozen, so distance calc stays consistent
+	ElapsedDelay: number,       -- accumulated total time spent frozen, subtracted from movement calc
 
 	Distance: number, -- distance travelled along path
 	ExtraDistance: number,
@@ -37,6 +38,7 @@ type EnemyData = {
 	Orientation: Vector3, -- yaw in degrees
 	PathIndex: number,
 
+	--// Summoner-specific fields, nil for non-summoners
 	summonTime: number | nil,
 	summonDelayTime: number | nil,
 	summonAnimationLength: number | nil,
@@ -45,18 +47,19 @@ type EnemyData = {
 
 	fat: number,
 	enemyStats: {any},
-	enemyValues: {string},
+	enemyValues: {string},      -- setting names pulled from the model's Settings folder
 	died: boolean,
 	
+	--// Attack system fields - populated from attacksData in EnemyStats
 	Attacks: { [number]: { string | number | {number} } } | nil,
-	activeAttacks: { { string | number | {number} } } | nil,
-	currentAttack: { string | number | {number} },
+	activeAttacks: { { string | number | {number} } } | nil,   -- subset of Attacks valid for the current phase
+	currentAttack: { string | number | {number} },              -- randomly picked from activeAttacks each cycle
 	lastAttackTime: number | nil,
-	Phase: number | nil,
+	Phase: number | nil,        -- nil if enemy has no phases, 1 or 2 otherwise
 	CashPerHit: number,
-	GodMode: boolean,
+	GodMode: boolean,           -- true during phase transitions so the enemy can't die mid-animation
 
-	state: string?
+	state: string?              -- "ActionState" while mid-summon or mid-attack, blocks other actions
 }
 type EnemyPool = { [string]: EnemyData }
 
@@ -67,10 +70,13 @@ local ServerStorage = game:GetService("ServerStorage")
 local TeleportService = game:GetService("TeleportService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+--// Networking - Packet wraps RemoteEvents with typed payloads so we're not sending unstructured garbage
 local Packet = require(ReplicatedStorage:WaitForChild("Packet"))
 local PathModule = require(ReplicatedStorage:WaitForChild("PathModule"))
 local NetworkUtilityModule = require(ReplicatedStorage:WaitForChild("NetworkUtility"))
 
+--// Packet definitions - each one declares its payload layout (U8, U16, F32 etc.)
+--// These get fired to clients to replicate enemy state without giving them raw server data
 local ReplicateEnemyEvent = Packet("ReplicateEnemy", Packet.NumberU8, Packet.NumberU16 , Packet.NumberU16)
 local SummonEnemyEvent = Packet("SummonEnemyEvent", Packet.NumberU8, Packet.NumberU16, Packet.NumberU16, Packet.NumberF32, Packet.NumberU32)
 
@@ -106,11 +112,13 @@ local GAME = ServerStorage:WaitForChild("GAME")
 local BaseHP = ServerStorage:WaitForChild("BaseHP")
 
 local mapWaypoints: { [number]: Instance } = {}
-local freezeTimes: { [string]: number } = {}
-local enemyPool: EnemyPool = {}
-local uniqueIdCounter = 0
+local freezeTimes: { [string]: number } = {}     -- tracks when each enemy was frozen, keyed by UniqueId
+local enemyPool: EnemyPool = {}                   -- master pool of all living enemies
+local uniqueIdCounter = 0                         -- monotonically increasing, never reused
 local enemyPoolCount = 0
 
+--// Enemies that get a dedicated healthbar on the client UI
+--// false = not yet spawned, flips to true on first spawn so we only send the track event once
 local healthbarEnemies = {
 	["FrostShade"] = false,
 	["FrostReaver"] = false,
@@ -119,12 +127,14 @@ local healthbarEnemies = {
 	["IceboundKrampus"] = false,
 }
 
+--// Multiplayer health scaling - each extra player adds 35% base HP to certain enemies
 local HEALTH_SCALE = 0.35
 local HEALTH_SCALE_TARGETS = {"RoboSanta", "FrostVanguard", "IceboundKrampus", "FrostSpirit", "FrostNecromancer", "FrostbiteRevenant", "CryingSpirit"}
 
 local wTowers = workspace:WaitForChild("Towers")
 
---// Load map waypoints & precompute
+--// Build the waypoint lookup table from workspace and feed it into PathModule
+--// PathModule.precomputePath turns these into cached line segments + bezier curves
 for _, child in waypointsFolder:GetChildren() do
 	local i = tonumber(child.Name)
 	if i then mapWaypoints[i] = child end
@@ -133,12 +143,15 @@ PathModule.precomputePath(1, mapWaypoints) -- 1 path for now
 
 
 --// Utilities
+
+--// Broadcast a packet to every connected player
 local function fireAllClients(packet: Packet.Packet, ...)
 	for _, player in Players:GetPlayers() do
 		packet:FireClient(player, ...)
 	end
 end
 
+--// Generic dictionary length since # only works on arrays
 local function _len(dictionary: { [any]: any }): number
 	local c = 0
 	for _, __ in dictionary do
@@ -147,6 +160,8 @@ local function _len(dictionary: { [any]: any }): number
 	return c
 end
 
+--// Finds all placed towers within a flat (XZ) radius of a position
+--// Used by the attack system to determine which towers get stunned
 local function getTowersInRange(position: Vector3, range: number): { Model }
 	local towersInRange = {}
 	
@@ -161,6 +176,8 @@ local function getTowersInRange(position: Vector3, range: number): { Model }
 	return towersInRange
 end
 
+--// Returns scaled health based on player count
+--// Solo player gets base health, each additional player adds HEALTH_SCALE % on top
 local function getScaledHealth(baseHealth: number): number
 	local playerCount = #Players:GetPlayers()
 	if playerCount <= 1 then
@@ -171,6 +188,8 @@ local function getScaledHealth(baseHealth: number): number
 	)
 end
 
+--// Core spawn function - creates the server-side enemy data, calculates scaled health,
+--// wires up attacks/phases/summon behavior, then replicates to all clients
 local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 | Instance | number })
 	local id = uniqueIdCounter
 	local uniqueId = name .. "_" .. id
@@ -179,6 +198,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 	local stats = EnemyStatsData[name]
 	params = params or {}
 	
+	--// Play spawn voice line if the enemy has one configured
 	if stats and stats.SoundData and stats.SoundData.SpawnLineID then
 		fireAllClients(PlaySoundPacket, stats.SoundData.SpawnLineID)
 	end
@@ -187,6 +207,8 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 	local fakeModel = EnemyModels[name]
 	local settingsFolder = fakeModel.Settings
 
+	--// Build the full EnemyData table
+	--// params come from summonEnemy when this is a summoned child: [1]=pos, [2]=orientation, [3]=waypoint, [4]=extraDistance
 	local now = workspace:GetServerTimeNow()
 	local enemy: EnemyData = {
 		Name = name,
@@ -202,7 +224,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 		ElapsedDelay = 0,
 
 		Distance = 0,
-		ExtraDistance = params[4] or 0,
+		ExtraDistance = params[4] or 0,       -- summoned enemies inherit parent's distance so they don't start from 0
 		Position =  params[1] or Vector3.zero,
 		Orientation = params[2] or Vector3.zero,
 		PathIndex = 1,
@@ -226,6 +248,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 		CashPerHit = stats.CashPerHit,
 		GodMode = false,
 		
+		--// Debug part for visualizing enemy position in studio, left commented out intentionally
 		--[[
 		PART = (function()
 			local part = Instance.new("Part")
@@ -242,13 +265,18 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 		--]]
 	}
 	
+	--// Apply multiplayer health scaling
 	enemy.Health = getScaledHealth(enemy.Health)
 
+	--// Pull setting names from the model's Settings folder into enemyValues
+	--// These act as tags/flags checked elsewhere (e.g. "Shielded", "Flying", etc.)
 	for _, settingValue in settingsFolder:GetChildren() do
 		table.insert(enemy.enemyValues, settingValue.Name)
 	end
 	settingsFolder = nil
 	
+	--// Wire up attack system if this enemy type has attacks defined
+	--// Each attack gets its own table with timing/range info, phase-gated attacks start inactive
 	if stats.attacksData then
 		enemy.activeAttacks = {}
 		enemy.lastAttackTime = now
@@ -260,20 +288,23 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 				animationEventLength = data.animationEventLength, 
 				attackFrequency = data.attackFrequency, 
 				freezeEnemyForSeconds = data.freezeEnemyForSeconds, 
-				actualFrequency = nil,
+				actualFrequency = nil,       -- randomized each cycle from attackFrequency range
 				phase = data.phase,
 				attackId = attackId,
 			}
 			
 			enemy.Attacks[attackId] = currentAttackTable
+			--// Only add to activeAttacks if the attack isn't phase-locked
 			if not data.phase then
 				table.insert(enemy.activeAttacks, currentAttackTable)
 			end
 		end
 		
+		--// Pick a random starting attack from the active pool
 		enemy.currentAttack = enemy.activeAttacks[math.random(1, #enemy.activeAttacks)]
 	end
 	
+	--// If this enemy supports phase transitions, start at phase 1
 	if stats.PhaseTwoData then
 		enemy.Phase = 1
 	end
@@ -283,8 +314,11 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 	enemyPool[uniqueId] = enemy
 	enemyPoolCount += 1
 
+	--// Encrypt the spawn time before sending to clients - prevents trivial speed/position manipulation
 	local encrypted = NetworkUtilityModule:EncryptNetworkServerTime(enemy.SpawnTime)
 
+	--// Summoned enemies use a different packet that includes their starting distance and health
+	--// so the client can place them at the correct path position immediately
 	if isSummoned then
 
 		local elapsed = now - enemy.SpawnTime
@@ -295,12 +329,15 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 		fireAllClients(ReplicateEnemyEvent, stats.EnemyIndex, encrypted, id)
 	end
 	
+	--// First-time healthbar tracking for boss/miniboss enemies
+	--// Also starts their theme music and triggers Krampus intro dialogue if applicable
 	if healthbarEnemies[name] == false then
 		healthbarEnemies[name] = true
 		if stats.SoundData then
 			fireAllClients(PlayMusicPacket, stats.SoundData.ThemeSongID)
 		end
 		
+		--// Krampus-specific intro sequence - staggered voice lines
 		if name == Enemy.FinalBossName then
 			print("Krampus spawn detected, playing voice lines!")
 			task.spawn(function()
@@ -319,6 +356,8 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 	Enemy.UpdateHP(uniqueId, enemy.Health)
 end
 
+--// Spawns multiple summoned enemies with a 0.3s stagger between each
+--// The extra distance offset per enemy prevents them from stacking on the exact same spot
 local function summonEnemy(name: string, amount: number, ...): ()
 	for i = 1, amount do
 		local args = {...}
@@ -328,6 +367,7 @@ local function summonEnemy(name: string, amount: number, ...): ()
 	end
 end
 
+--// Public API - spawns a wave of non-summoned enemies with a configurable delay between each
 function Enemy.new(name: string, amount: number, delayTime: number): EnemyData
 	for i = 1, amount do
 		spawnEnemy(name)
@@ -338,6 +378,9 @@ end
 function Enemy.GetActiveEnemies(): EnemyPool
 	return enemyPool
 end
+
+--// Freeze helpers - freezing an enemy snapshots its elapsed movement time so it stops advancing
+--// Unfreezing adds the frozen duration to ElapsedDelay so the movement formula picks up where it left off
 
 local function beginFreeze(enemy, now, elapsed): number
 	enemy.FixedElapsed = elapsed - enemy.ElapsedDelay
@@ -359,6 +402,7 @@ local function unfreezeEnemy(enemy: EnemyData, now: number): ()
 	end
 end
 
+--// Externally triggered freeze - used by towers or abilities that stun enemies for a set duration
 function Enemy.Stop(now: number, elapsed: number, id: string, givenDuration: number)
 	local enemy = enemyPool[id]
 	beginFreeze(enemy, now, elapsed)
@@ -368,14 +412,18 @@ function Enemy.Stop(now: number, elapsed: number, id: string, givenDuration: num
 	endFreeze(enemy, now)
 end
 
+--// Summoner-type enemy action - freezes the enemy, plays the summon animation,
+--// spawns the child enemy(ies) at the summoner's current position, then unfreezes
 function Enemy.SummonerStop(now: number, elapsed: number, id: string)
 	local enemy = enemyPool[id]
 	local encrypted = beginFreeze(enemy, now, elapsed)
 
 	fireAllClients(SummonerEnemyEvent, enemy.enemyStats.EnemyIndex, encrypted, tonumber(id:split("_")[2]))
 
+	--// Wait for the pre-summon windup
 	task.wait(enemy.summonDelayTime)
 
+	--// Resolve what to summon - can be a single name, a list, or a random pick from a list
 	local enemyToSummon = enemy.enemyToSummon
 	if typeof(enemyToSummon) == "string" then
 		task.spawn(summonEnemy, enemyToSummon, 1, enemy.Position, enemy.Orientation, enemy.CurrentWaypoint, enemy.Distance, enemy.SpawnTime, enemy.Speed)
@@ -384,12 +432,14 @@ function Enemy.SummonerStop(now: number, elapsed: number, id: string)
 			local chosen = enemyToSummon[math.random(1, #enemyToSummon)]
 			task.spawn(summonEnemy, chosen, 1, enemy.Position, enemy.Orientation, enemy.CurrentWaypoint, enemy.Distance, enemy.SpawnTime, enemy.Speed)
 		else
+			--// Summon all entries in the table
 			for _, enemyName in enemyToSummon do
 				task.spawn(summonEnemy, enemyName, 1, enemy.Position, enemy.Orientation, enemy.CurrentWaypoint, enemy.Distance, enemy.SpawnTime, enemy.Speed)
 			end
 		end
 	end
 
+	--// Wait out the rest of the summon animation after the actual spawn happened
 	task.wait(enemy.summonAnimationLength - enemy.summonDelayTime)
 
 	endFreeze(enemy, now)
@@ -400,6 +450,7 @@ function Enemy.GetFarthestEnemy(): EnemyData
 	return Enemy.FarthestEnemy
 end
 
+--// Central HP update function - handles damage, death, phase transitions, on-death summons, and win condition
 function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- HP TO CHECK
 	local enemy = enemyPool[uniqueId]
 	if not enemy then return end
@@ -410,23 +461,29 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 	local numId = tonumber(uniqueId:split("_")[2])
 
 	if newhp <= 0 then
+		--// Prevent double-death if multiple damage sources hit simultaneously
 		if enemy.died then return end
 		
+		--// Phase transition check - if enemy is in phase 1 and has phase 2 data,
+		--// don't kill it, instead freeze it, restore HP, swap active attacks, and transition
 		if enemy.Phase and enemy.Phase == 1 then
 			local now = workspace:GetServerTimeNow()
 			local elapsed = now - enemy.SpawnTime
 			local encrypted = NetworkUtilityModule:EncryptNetworkServerTime(now)
 			enemy.FixedElapsed = elapsed - enemy.ElapsedDelay
 
+			--// Lock the enemy in place during the transition animation
 			enemy.state = "ActionState"
 			freezeTimes[enemy.UniqueId] = now
 			fireAllClients(NewPhaseEvent, numId, 2) -- automatically choose second phase (default)
 			fireAllClients(FreezeEnemyEvent, numId, encrypted)
 			
+			--// Set phase 2 health, scaled for player count
 			local phaseTwoHealth = phaseTwoData.PhaseTwoHealth
 			phaseTwoHealth = getScaledHealth(phaseTwoHealth)
 			enemy.Health = phaseTwoHealth
 
+			--// GodMode prevents any damage during the transition window
 			enemy.GodMode = true
 			
 			local stats = enemy.enemyStats
@@ -436,6 +493,7 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 			
 			fireAllClients(UpdateEnemyHealthEvent, numId, phaseTwoHealth)
 			
+			--// Rebuild activeAttacks for phase 2 - swap out phase 1 attacks for phase 2 ones
 			enemy.Phase += 1
 			enemy.lastAttackTime = now
 			enemy.activeAttacks = {}
@@ -446,11 +504,13 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 			end
 			enemy.currentAttack = enemy.activeAttacks[math.random(1, #enemy.activeAttacks)]
 
+			--// After the transition duration, unfreeze and apply any phase-specific enemy values
 			task.delay(phaseTwoData.PhaseTwoTransitionDuration, function()
 				if enemy then
 					unfreezeEnemy(enemy, workspace:GetServerTimeNow())
 					enemy.state = nil
 					
+					--// Phase 2 might grant new properties (e.g. "Shielded", "Enraged")
 					local extraValues = phaseTwoData.PhaseEnemyValues
 					for _, value: string? in extraValues do
 						if typeof(value) == "string" then
@@ -465,13 +525,16 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 			return
 		end
 
+		--// Actual death path - cache position data before cleanup for on-death summons
 		local deathPosition, deathOrientation, deathCurrentWaypoint, deathDistanceReached = enemy.Position, enemy.Orientation, enemy.CurrentWaypoint, enemy.Distance
 
 		enemy.Health = 0
+		--// Stop boss theme music if this was a tracked healthbar enemy
 		if enemy.SOUND_MARKED and enemy.enemyStats and enemy.enemyStats.SoundData and enemy.enemyStats.SoundData.ThemeSongID then
 			fireAllClients(StopMusicPacket, enemy.enemyStats.SoundData.ThemeSongID)
 		end
 		enemy.died = true
+		--// Only play death sound for real kills, not autoclears (wave skip / cleanup)
 		if arg ~= "autoclear" then
 			if enemy.enemyStats.SoundData and enemy.enemyStats.SoundData.DeathSoundID then
 				fireAllClients(PlaySoundPacket, enemy.enemyStats.SoundData.DeathSoundID)
@@ -479,12 +542,14 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 		end
 		fireAllClients(UpdateEnemyHealthEvent, tonumber(uniqueId:split("_")[2]), newhp)
 
+		--// On-death summoning - some enemies spawn children when they die (e.g. splitting enemies)
 		local stats = enemy.enemyStats
 		if stats.summonType == "OnDeath" then
 			local summonData = stats.summonData
 			local summonedEntityName = summonData.summonedEntityName
 			local summonedEntityAmount = summonData.summonedEntityAmount
 
+			--// Resolve name - can be a table for random picks
 			local toSummonEnemyName
 			if type(summonedEntityName) == "table" then
 				local chosen = math.random(1, #summonedEntityName)
@@ -496,14 +561,18 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 			local now = workspace:GetServerTimeNow()
 			task.spawn(summonEnemy, toSummonEnemyName, summonedEntityAmount, deathPosition, deathOrientation, deathCurrentWaypoint, deathDistanceReached, enemy.SpawnTime, enemy.Speed)
 		end
+		--// Remove from pool and tell clients to clean up
 		fireAllClients(RemoveEnemyEvent, numId)
 		enemyPool[uniqueId] = nil
 		enemyPoolCount -= 1
 	else
+		--// Not dead - just update HP and replicate
 		enemy.Health = newhp
 		fireAllClients(UpdateEnemyHealthEvent, tonumber(uniqueId:split("_")[2]), newhp)
 	end
 	
+	--// Win condition check - if the final boss just died (and it wasn't an autoclear),
+	--// trigger the victory sequence: voice lines, award wins, then teleport everyone to lobby
 	if arg == "autoclear" then
 		print("Autocleared.")
 		--
@@ -512,6 +581,7 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 			print("Game cleared succesfully!")
 			fireAllClients(PlaySoundPacket, 2)
 			task.wait(1)
+			--// Staggered Krampus defeat dialogue
 			fireAllClients(KrampusMessagePacket, 4)
 			task.wait(8)
 			fireAllClients(KrampusMessagePacket, 5)
@@ -519,6 +589,7 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 			fireAllClients(KrampusMessagePacket, 6)
 			task.wait(8)
 			GAME.Value = false
+			--// Award wins to all connected players, deduped
 			local awarded = {}
 			for _, player: Player in Players:GetPlayers() do
 				if not table.find(awarded, player) then
@@ -529,6 +600,7 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 			
 			fireAllClients(GameEndPacket, 1)
 			fireAllClients(PlayMusicPacket, 102)
+			--// Give players 60 seconds on the victory screen before booting them
 			task.delay(60, function()
 				print("Teleporting remaining players..")
 				for _, player: Player in Players:GetPlayers() do
@@ -543,6 +615,7 @@ function Enemy.GetActiveEnemyCount(): number
 	return enemyPoolCount
 end
 
+--// Nuke the entire pool - used for wave resets or game end cleanup
 function Enemy.ClearAllEnemies(): ()
 	for id, enemy in enemyPool do
 		Enemy.UpdateHP(id, 0, "autoclear")
@@ -551,12 +624,16 @@ function Enemy.ClearAllEnemies(): ()
 	enemyPoolCount = 0
 end
 
+--// Main loop - runs on Heartbeat, handles all per-frame enemy logic:
+--// movement, path completion (base damage), summoner scheduling, attack scheduling, farthest enemy tracking
 function Enemy.Init(serverModules)
 	print("SERVER Enemy system initialized")
 
 	BaseModule = serverModules["Base"]
 	task.wait(5)
 	
+	--// Accumulator for server time sync broadcasts - sends encrypted time to clients at 20hz
+	--// Clients use this to stay in sync for position interpolation
 	local accumulator = 0
 	RunService.Heartbeat:Connect(function(dt)
 		local now = workspace:GetServerTimeNow()
@@ -567,6 +644,7 @@ function Enemy.Init(serverModules)
 			fireAllClients(SyncToServerTimeEvent,  NetworkUtilityModule:EncryptNetworkServerTime(now))		
 		end
 		
+		--// Track farthest enemy each frame for tower targeting priority
 		local farthestDistance = 0
 		local farthestEnemy = nil
 
@@ -579,11 +657,16 @@ function Enemy.Init(serverModules)
 		for id, enemy in enemyPool do
 			if enemy.Health <= 0 then continue end
 
+			--// Core movement formula: distance = speed * effectiveTime + extraDistance
+			--// FixedElapsed is used when frozen (snapshot), otherwise we compute live elapsed minus total freeze time
 			local elapsed = now - enemy.SpawnTime
 			local distanceTravelled = enemy.Speed * ( enemy.FixedElapsed or (elapsed - enemy.ElapsedDelay)) + enemy.ExtraDistance
 
 			enemy.Distance = distanceTravelled
 			if distanceTravelled > farthestDistance then farthestDistance = distanceTravelled farthestEnemy = enemy end
+			
+			--// Check if the enemy has reached the end of the path
+			--// If so, deal damage to the base equal to its remaining HP, then remove it
 			local path = PathModule.getPathByIndex(enemy.PathIndex)
 			if path then
 				if enemy.Distance >= path.totalLength then
@@ -603,6 +686,7 @@ function Enemy.Init(serverModules)
 				end
 			end
 
+			--// Resolve world position + facing direction from distance along the precomputed path
 			local pos, forward, waypoint = PathModule.getPathPositionFromDistance(enemy.PathIndex, enemy.Distance)
 			if pos then
 				enemy.Position = pos
@@ -620,7 +704,8 @@ function Enemy.Init(serverModules)
 				end
 				--]]
 				
-
+				--// Summoner check - if enough time has passed since last summon, trigger the summon action
+				--// Sets state to ActionState which blocks movement and other actions during the animation
 				if enemy.summonTime and not (enemy.state == "ActionState") then
 					local timeSinceSpawn = now - enemy.previousSummonTime
 					if timeSinceSpawn >= enemy.summonTime then
@@ -638,15 +723,20 @@ function Enemy.Init(serverModules)
 				Enemy.FarthestEnemy = farthestEnemy
 			end
 			
+			--// Attack scheduling - if this enemy has attacks and isn't already mid-action
+			--// Randomizes frequency each cycle from the configured range for less predictable patterns
 			local attacksData = enemy.Attacks
 			if attacksData and enemy.currentAttack then
 				if enemy.state == "ActionState" then continue end
 				
 				local data = enemy.currentAttack
+				--// Roll a random frequency if we haven't yet this cycle
 				if not data.actualFrequency then
 					data.actualFrequency = math.random(data.attackFrequency[1], data.attackFrequency[2])
 				end
 				
+				--// Time to attack - freeze the enemy, find towers in range, play the attack animation,
+				--// stun those towers, then unfreeze and pick the next attack
 				if now - enemy.lastAttackTime >= data.actualFrequency then
 					enemy.state = "ActionState"
 					enemy.lastAttackTime = now
@@ -655,6 +745,7 @@ function Enemy.Init(serverModules)
 					freezeTimes[enemy.UniqueId] = now
 					fireAllClients(FreezeEnemyEvent, enemy.NumId, encrypted)
 
+					--// Grab towers in range at the moment the attack starts
 					local towersInRange = getTowersInRange(enemy.Position, data.range)
 					if enemy and enemy.enemyStats and enemy.enemyStats.SoundData and enemy.enemyStats.SoundData.AttackLinesID then
 						fireAllClients(PlaySoundPacket, enemy.enemyStats.SoundData.AttackLinesID)
@@ -662,23 +753,28 @@ function Enemy.Init(serverModules)
 					fireAllClients(EnemyAttackEvent, enemy.NumId, enemy.currentAttack.attackId)
 					task.spawn(function()
 
+						--// Wait for the animation to reach the "hit" event point, then apply stun
 						task.wait(data.animationEventLength)
 						for _, tower: Model in towersInRange do
 							tower:SetAttribute("Stunned", true)
 						end
+						--// Wait for the rest of the attack duration after the hit landed
 						local diff1 = data.duration - data.animationEventLength
 						task.wait(diff1)
 
+						--// Unfreeze enemy and clear action state so it can move again
 						unfreezeEnemy(enemy, workspace:GetServerTimeNow())
 						enemy.state = nil
-						data.actualFrequency = nil
+						data.actualFrequency = nil     -- will re-roll next cycle
 
+						--// Towers stay stunned for a bit longer after the enemy resumes moving
 						task.wait(data.freezeEnemyForSeconds - diff1)
 						for _, tower: Model in towersInRange do
 							if not tower then continue end
 							tower:SetAttribute("Stunned", nil)
 						end
 						
+						--// Pick next attack randomly from the active pool
 						enemy.currentAttack = enemy.activeAttacks[math.random(1, #enemy.activeAttacks)]
 					end)
 				end
