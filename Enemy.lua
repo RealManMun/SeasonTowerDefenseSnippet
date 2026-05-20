@@ -1,4 +1,5 @@
---//  Server handler for enemies, will not display more than this for the enemy system - to make it impossible to replicate unless you'd rewrite your own system. Feel free to learn from this code tho.
+-- Connected Discord-GitHub
+--//  Server handler for enemies, will not display more than this for the enemy system - to make it impossible to replicate unless you'd rewrite your own system. Feel free to learn from this code, regardless of skill level.
 
 --[[
 
@@ -7,17 +8,14 @@ note note here
 For a submission, this script pretty much covers an entiry enemy lifecycle, how it moves, some typechecking, some scheduling for attacks, summons, usual things you'd be finding in tower defense games - as well as
 some cool little phase/state transitions.
 
-that thing about the comments being ai did hit pretty hard - so I won't waste time on grammar and describe in detail what the code does, but with my own way of commenting, which is NOT against the rules,
-I am not trolling, I probably am better than you at programming junior (you get who I am mimicking?)
-I have read those guidelines like 10 times so cut me some slack, how was I supposed to know using proper grammar counts as AI now?? 
-
-any questions about how this code works? I can hop in a voicechat and easily explain any part, from the deltaTime maths for delaying and syncing client-server, bulk movements, anything, although that won't be necessary.
+any questions about how this code works? I can hop in a voicechat and easily explain any part, from the deltaTime maths for delaying and syncing client-server, bulk movements, anything, although that won't be necessary
 nobody even reads this part anyway
 
 --]]
 
 --//  @RealManMun 27th August 2025
 
+--// Initializing an enemy module, which handles not an individual enemy but rather all enemies inside of its logic, some of the properties explain themselves, while Priority is strictly tied to the framework
 local Enemy = {}
 Enemy.Priority = 2
 Enemy.FarthestEnemy = nil
@@ -25,7 +23,7 @@ Enemy.FinalBossName = "IceboundKrampus"
 Enemy.MarkedBosses = {}
 
 --// Types
---// enemydata type, what more could you ask, also I am not exporting all of this data meaninglessly, just used typechecking because I fancy it here
+--// inside of "Enemy", we will have the enemies themselves, and they all follow a specific pattern, from their name, specific id based on a counter to the time-based movement data inside
 type EnemyData = {
 	Name: string,
 	UniqueId: string,
@@ -45,30 +43,28 @@ type EnemyData = {
 	Orientation: Vector3, -- just for reference, this is the yaw in degrees, not just normal orientation
 	PathIndex: number,
 
-	--// bad boy summoners, on a serious note - this is pretty important for functionality
+	--// bad boy summoners, on a serious note - this is pretty important for enemies that can resummon themselves / summon other enemies, either on death or timed
 	summonTime: number | nil,
 	summonDelayTime: number | nil,
 	summonAnimationLength: number | nil,
 	enemyToSummon: string | { string } | nil,
 	previousSummonTime: number | nil,
 
-	fat: number, -- listen, I get it sounds weird, okay? it's just, well, accurate, for calculating offsets
+	fat: number, -- while it may sound big, it's actually just used for calculating offsets
 	enemyStats: {any},
-	enemyValues: {string},      -- practically just a check to see if the enemy is hidden/flying or not, special type of enemies, play TDS for reference, cool game - get me a job there while you're at it
+	enemyValues: {string}, -- practically just a check to see if the enemy is hidden/flying or not, special type of enemies - for reference, play the actual game associated: Season Tower Defense
 	died: boolean,
 	
-	--// enemies have to attack, don't they? they have a set of attacks, the ones that are currently active for their phase (rare case), the attack they are focused in this attack cycle, the last time they've attacked for
-	-- time calculation (on my monitor the text was going off screen, thus me inserting a new line)
+	--// enemies attack your troops, not for dealing damage but for temporarily stunning them, they have a specific range, different attacks, timings, etc..
 	Attacks: { [number]: { string | number | {number} } } | nil,
 	activeAttacks: { { string | number | {number} } } | nil,
 	currentAttack: { string | number | {number} },
 	lastAttackTime: number | nil,
 	Phase: number | nil, -- I've mentioned phases before, haven't I?
 	CashPerHit: number,
-	GodMode: boolean, -- big boy FrostSpirit goes from standing to flying and smashing all your towers to pieces - boom boom, anyway, getting hit by towers without flying detection during a transition was cutting off like
-	-- half of its hp, you can tell why this is here
+	GodMode: boolean, -- some enemies like the FrostSpirit transition from a ground enemy to a flying one, during that transition they should not be able to be hit by towers, thus the existence of this extra boolean
 
-	state: string? -- no fancy state manager, is this enemy loser attacking / summoning or something? ask yourself that when you see state being mentioned, and you'll be good to go
+	state: string? -- no fancy state manager, is the enemy attacking / summoning something? is it in a transition of sorts? the state boolean answers these questions
 }
 type EnemyPool = { [string]: EnemyData }
 
@@ -79,12 +75,11 @@ local ServerStorage = game:GetService("ServerStorage")
 local TeleportService = game:GetService("TeleportService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
---// Networking - using Packet for buffering, you should too 
+--// Networking - using a free library called "Packet" for buffering, you may consider "Packets" as remotes, as there are quite a few of them, and seeing them that way makes things easier
 local Packet = require(ReplicatedStorage:WaitForChild("Packet"))
 local PathModule = require(ReplicatedStorage:WaitForChild("PathModule"))
 local NetworkUtilityModule = require(ReplicatedStorage:WaitForChild("NetworkUtility"))
 
--- I mean, it does quite literally replace remote events through its own custom system, for more reference google it or just use some cheap ai
 local ReplicateEnemyEvent = Packet("ReplicateEnemy", Packet.NumberU8, Packet.NumberU16 , Packet.NumberU16)
 local SummonEnemyEvent = Packet("SummonEnemyEvent", Packet.NumberU8, Packet.NumberU16, Packet.NumberU16, Packet.NumberF32, Packet.NumberU32)
 
@@ -119,15 +114,14 @@ local GAME = ServerStorage:WaitForChild("GAME")
 
 local BaseHP = ServerStorage:WaitForChild("BaseHP")
 
--- see, I try to optimize my code (give it a shot) | so all enemies are neatly defined in the enemypool, they all have uniqueids, not randomly generated just increasingly being counted, I wanted to do something with
--- fancy buffering (my monitor is average, okay?) but scrapped it, tho I still believe my approach was the best here
+-- waypoints, freezetimes for checking which zombies are freezed and when to process deltaTime data, the actual enemypool containing the enemies
 local mapWaypoints: { [number]: Instance } = {}
 local freezeTimes: { [string]: number } = {}
 local enemyPool: EnemyPool = {} 
 local uniqueIdCounter = 0 
 local enemyPoolCount = 0
 
--- what do you think? | bosses have healthbars, they should appear once tho not every time or it would lowkey piss me off
+-- bosses have healthbars, and they should only appear when they first spawn - handling this in the overseer for enemies (this module) directly rather than externally seems much more secure
 local healthbarEnemies = {
 	["FrostShade"] = false,
 	["FrostReaver"] = false,
@@ -136,13 +130,13 @@ local healthbarEnemies = {
 	["IceboundKrampus"] = false,
 }
 
---// I mean, if you have 10 players or something it does get unfair doesn't it? should make it scale like a proper game dev, you can learn from this, seriously
+--// for a higher number of players, difficulty should naturally scale, but not for all enemies - since cash already scales harshly, just the main bosses 
 local HEALTH_SCALE = 0.35
 local HEALTH_SCALE_TARGETS = {"RoboSanta", "FrostVanguard", "IceboundKrampus", "FrostSpirit", "FrostNecromancer", "FrostbiteRevenant", "CryingSpirit"}
 
 local wTowers = workspace:WaitForChild("Towers")
 
--- you wanna check the pathmodule to see if I'm better than you at programming concepts? go for it, same github | precomputes a path, no point in recreating it any time, just use time as a source of movement silly!
+-- the path module precomputes is not necessary for an overall comprehension of the code, however, if you want to challenge yourself and see if you are somewhere around my level in thinking scopes - feel free to do so, as it's referenced directly in the same repository
 for _, child in waypointsFolder:GetChildren() do
 	local i = tonumber(child.Name)
 	if i then mapWaypoints[i] = child end
@@ -152,14 +146,14 @@ PathModule.precomputePath(1, mapWaypoints) -- 1 path for now
 
 --// Utilities
 
---// packet needs a fireallclients feature, doesn't it? maybe I just missed it
+--// making our lives easier, since we do not use remote functions, just remote events, and we create a fireallclients feature manually for packet
 local function fireAllClients(packet: Packet.Packet, ...)
 	for _, player in Players:GetPlayers() do
 		packet:FireClient(player, ...)
 	end
 end
 
---// if you think of adding a different module for this - you're probably right, but hey, does it really matter?
+--// quickly getting the length of a luau table type "dictionary", we cannot use a shortcut like #, as dictionaries handle length differently due to the possibility of hogging nil data 
 local function _len(dictionary: { [any]: any }): number
 	local c = 0
 	for _, __ in dictionary do
@@ -168,7 +162,7 @@ local function _len(dictionary: { [any]: any }): number
 	return c
 end
 
---// we have to get the enemies in range of the aforementioned big strong attacks from those bad enemies, so what do we do? use a basic function to get them, obviously.
+--// we have to get the enemies in range of the aforementioned strong attacks from those bad enemies, so what do we do? use a looping function to get them, ignoring y coordinate for distance so we get accurate magnitude
 local function getTowersInRange(position: Vector3, range: number): { Model }
 	local towersInRange = {}
 	
@@ -203,7 +197,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 	local stats = EnemyStatsData[name]
 	params = params or {}
 	
-	--// we play a voiceline if sounddata has an id marked to it, the id isn't the sound id, it's a buffering custom id each individual sound is assigned, I told you I'm probably better, didn't I?
+	--// we play a voiceline if sounddata has an id marked to it, the id isn't the sound id, it's a buffering custom id each individual sound is assigned
 	if stats and stats.SoundData and stats.SoundData.SpawnLineID then
 		fireAllClients(PlaySoundPacket, stats.SoundData.SpawnLineID)
 	end
@@ -213,7 +207,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 	local settingsFolder = fakeModel.Settings
 
 	--// we created that huge type, now we need to configure it
-	local now = workspace:GetServerTimeNow() -- timebased movements proved to be more accurate, you know? also only losers actually use tick nowadays from what I've heard
+	local now = workspace:GetServerTimeNow() -- timebased movements proved to be more accurate, and it helps remove the overshooting deltatime issue entirely
 	local enemy: EnemyData = {
 		Name = name,
 		UniqueId = uniqueId,
@@ -229,7 +223,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 
 		Distance = 0,
 		ExtraDistance = params[4] or 0,  -- easiest way to do this: summoned enemies need to get their parent's traveled distance as an addon for their overall distance on the precomputed path, you can apply some fancy
-		-- speed scaling math instead, but I'd rather not bother with that, simplicity makes the genius after all (I'm no genius so don't ask me)
+		-- speed scaling math instead, but I'd rather not bother with that, simplicity makes it better
 		Position =  params[1] or Vector3.zero,
 		Orientation = params[2] or Vector3.zero,
 		PathIndex = 1,
@@ -241,7 +235,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 		isSummonRandom = summonData[5] or nil,
 		previousSummonTime = now,
 
-		fat = 0, -- shut up about this naming already
+		fat = 0, -- don't even mention this naming
 		enemyStats = stats,
 		enemyValues = {},
 		died = false,
@@ -253,7 +247,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 		CashPerHit = stats.CashPerHit,
 		GodMode = false,
 		
-		--// wanna track how it moves on the server and see that dt issues when pausing the studio and accounting for delays is entirely removed from my timebased system? use this part, and give it a shot, hehe.
+		--// tracking to see if server is in sync with the client or for new enemy types or other possible addons in the future, it's just a normal part created by a function being called and returning it to the caller directly
 		--[[
 		PART = (function()
 			local part = Instance.new("Part")
@@ -273,7 +267,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 	--// apply the actual health scale
 	enemy.Health = getScaledHealth(enemy.Health)
 
-	--// visually, it's more pleasant to just see values inside of enemies so you can add Flying and Hidden enemies, but practically, why copy the same thing millions of times? just remove it entirely
+	--// visually, it's more pleasant to just see values inside of enemies so you can add Flying and Hidden enemies, but practically, why copy the same thing millions of times? no need to replicate those instances, we can just track them here and provide them later where they are needed
 	-- roblox handles memory for such things alone, so I won't bother going into that
 	for _, settingValue in settingsFolder:GetChildren() do
 		table.insert(enemy.enemyValues, settingValue.Name)
@@ -284,7 +278,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 	if stats.attacksData then
 		enemy.activeAttacks = {}
 		enemy.lastAttackTime = now
-		-- self explanatory 
+		-- self explanatory, looping through the attack data, setting it up, setting to the the enemy's attacks by the attack's respective id, then handling phase-related info
 		for attackId: number, data: {any} in stats.attacksData do
 			local currentAttackTable = { 
 				lastAttackTime = now, 
@@ -305,7 +299,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 			end
 		end
 		
-		--// actually picking the attack (what if I use perlin noise? could make the attacks *smoother*?) | jokes, but seriously, you can learn about it
+		--// actually picking the attack
 		enemy.currentAttack = enemy.activeAttacks[math.random(1, #enemy.activeAttacks)] -- not gonna use Random instead, math.random always seemed good unless we are talking about a weighted chance system by comparison
 	end
 	
@@ -328,7 +322,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 
 		local elapsed = now - enemy.SpawnTime
 		local distanceTravelled = enemy.Speed * ( enemy.FixedElapsed or (elapsed - enemy.ElapsedDelay)) + enemy.ExtraDistance
-
+		-- we calculate the actual extra distance travelled, and we send it to the client to have as well based on the id, then it tracks and properly replicates it
 		fireAllClients(SummonEnemyEvent, stats.EnemyIndex, id, encrypted, distanceTravelled, enemy.Health)
 	else
 		fireAllClients(ReplicateEnemyEvent, stats.EnemyIndex, encrypted, id)
@@ -337,7 +331,7 @@ local function spawnEnemy(name: string, isSummoned: boolean, params: { Vector3 |
 	--// track healthbars properly once the bosses finally spawn for the first time, as well as the theme music for them (fire songs btw, listen to them if you have the time)
 	if healthbarEnemies[name] == false then
 		healthbarEnemies[name] = true
-		-- yes, the ThemeSongID is also properly buffered
+		-- yes, the ThemeSongID is also properly buffered, as all numbers should be if possible
 		if stats.SoundData then
 			fireAllClients(PlayMusicPacket, stats.SoundData.ThemeSongID)
 		end
@@ -374,7 +368,7 @@ local function summonEnemy(name: string, amount: number, ...): ()
 	end
 end
 
---// used by either wave system or just admin commands if I wanna play around with them - what's that, you want admin too? no.
+--// used by either wave system or just admin commands if I wanna play around with them
 function Enemy.new(name: string, amount: number, delayTime: number): EnemyData
 	for i = 1, amount do
 		spawnEnemy(name)
@@ -400,7 +394,7 @@ local function endFreeze(enemy, now): ()
 end
 
 -- seems like two systems are merged into one another, two different ideas plastered onto one - but summoning is a fixed process, which can all be determined at once regardless of external matters other than the enemy's health
--- while on the other side, attacking is done based on towers around you by default, so it cannot be controlled - too far gone? I am insane.
+-- while on the other side, attacking is done based on towers around you by default, so it cannot be controlled
 local function unfreezeEnemy(enemy: EnemyData, now: number): ()
 	if (enemy.FixedElapsed and freezeTimes[enemy.UniqueId]) then
 		local encrypted = NetworkUtilityModule:EncryptNetworkServerTime(now)
@@ -421,7 +415,7 @@ function Enemy.Stop(now: number, elapsed: number, id: string, givenDuration: num
 	endFreeze(enemy, now)
 end
 
---// freeze and unfreeze mechanic, but this time - for summoners, which have children to care for and deploy as puppets, reminds me of war games, ever played those?
+--// freeze and unfreeze mechanic, but this time - for summoners, which have children to care for and deploy as puppets, reminds me of war games actually now that I think about it while writing the comments for this code
 function Enemy.SummonerStop(now: number, elapsed: number, id: string)
 	local enemy = enemyPool[id]
 	local encrypted = beginFreeze(enemy, now, elapsed)
@@ -447,7 +441,7 @@ function Enemy.SummonerStop(now: number, elapsed: number, id: string)
 		end
 	end
 
-	--// we must wait for the cool animation my dear friend that I've enslaved made, then move forward.
+	--// we must wait for the cool animation my dear friend that I've enslaved made, then move forward
 	task.wait(enemy.summonAnimationLength - enemy.summonDelayTime)
 
 	endFreeze(enemy, now)
@@ -458,7 +452,7 @@ function Enemy.GetFarthestEnemy(): EnemyData
 	return Enemy.FarthestEnemy
 end
 
---// updating hp, handles a bunch of stuff in here
+--// updating hp, handles quite a few mechanics in this block of code
 function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- HP TO CHECK
 	local enemy = enemyPool[uniqueId]
 	if not enemy then return end
@@ -469,10 +463,10 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 	local numId = tonumber(uniqueId:split("_")[2]) -- let's get the id so we can get enemy data later on
 
 	if newhp <= 0 then
-		--// can't have multiple deaths at once or it might cause bugs, easy debouncer, in the truest sense tho - not just learned from a tutorial and then copy pasted the same trash debounce logic everywhere
+		--// can't have multiple deaths at once or it might cause bugs, easy debouncer
 		if enemy.died then return end
 		
-		--// phase 2? interesting, says the luau compiler, probably
+		-// enter phase two logic here
 		if enemy.Phase and enemy.Phase == 1 then
 			local now = workspace:GetServerTimeNow()
 			local elapsed = now - enemy.SpawnTime
@@ -531,7 +525,7 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 			return
 		end
 
-		-- ah, we need a bunch of stuff to fully kill this enemy
+		-- ah, we need a bunch of stuff to fully kill this enemy, by that I mean properly sending death data towards the client
 		local deathPosition, deathOrientation, deathCurrentWaypoint, deathDistanceReached = enemy.Position, enemy.Orientation, enemy.CurrentWaypoint, enemy.Distance
 
 		enemy.Health = 0
@@ -548,7 +542,7 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 		end
 		fireAllClients(UpdateEnemyHealthEvent, tonumber(uniqueId:split("_")[2]), newhp)
 
-		--// mystery type enemies have to spawn something on death; surprise! not only locked to them tho | if you are thinking of using this to actually handle something like a phase two transition, stop being so lazy, bad practice
+		--// mystery type enemies have to spawn something on death; surprise! not only locked to them tho | if you are thinking of using this to actually handle something like a phase two transition, it's quite a bad practice
 		local stats = enemy.enemyStats
 		if stats.summonType == "OnDeath" then
 			local summonData = stats.summonData
@@ -582,7 +576,7 @@ function Enemy.UpdateHP(uniqueId: string, newhp: number, arg: string | nil) -- H
 		print("Autocleared.")
 		--
 	else
-		if enemy.Health == 0 and enemy.Name == Enemy.FinalBossName then --// what happened with the voicelines had to happen with the displays, ignorance is truly a sin, no doubt - but is laziness not one as well?
+		if enemy.Health == 0 and enemy.Name == Enemy.FinalBossName then --// what happened with the voicelines had to happen with the displays, ignorance is truly a sin, no doubt
 			print("Game cleared succesfully!")
 			fireAllClients(PlaySoundPacket, 2)
 			task.wait(1)
@@ -631,7 +625,7 @@ function Enemy.ClearAllEnemies(): ()
 	enemyPoolCount = 0
 end
 
---// this is where the movement is being tracked, called within a priority based framework written by me (told you I'm good)
+--// this is where the movement is being tracked, called within a priority based framework written by me (I might be pretty goated)
 function Enemy.Init(serverModules)
 	print("SERVER Enemy system initialized")
 
@@ -639,8 +633,7 @@ function Enemy.Init(serverModules)
 	task.wait(5)
 	
 	--// sync at 20hz using an accumulator based on deltatime, no need to worry about overshooting here since the client lag would cause delays fixed by the servers as soon as the game regulates itself, for extreme cases
-	-- roblox handles them by removing you from the game, some games with valuable trade markets kick you on very low framerate, but I find that unfair, I always thought they are just not as good as me - turned out
-	-- to be accurate, due to laziness
+	-- roblox handles them by removing you from the game, some games with valuable trade markets kick you on very low framerate, but I find that unfair, I always thought they are just not as good as me - turned out that wasn't true
 	local accumulator = 0
 	RunService.Heartbeat:Connect(function(dt)
 		local now = workspace:GetServerTimeNow()
@@ -740,10 +733,10 @@ function Enemy.Init(serverModules)
 				local data = enemy.currentAttack
 				--// we haven't been here in our current attack cycle? we need to have a frequency before moving forward, so we generate it randomly
 				if not data.actualFrequency then
-					data.actualFrequency = math.random(data.attackFrequency[1], data.attackFrequency[2]) -- now, what about perlin-noising it? I'm losing it.
+					data.actualFrequency = math.random(data.attackFrequency[1], data.attackFrequency[2])
 				end
 				
-				--// attack, stun the towers, end my suffering.
+				--// attack, stun the towers
 				if now - enemy.lastAttackTime >= data.actualFrequency then
 					enemy.state = "ActionState"
 					enemy.lastAttackTime = now
@@ -790,4 +783,4 @@ function Enemy.Init(serverModules)
 	end)
 end
 
-return Enemy --// properly finish the work by returning
+return Enemy --// properly finish the work by returning the "Enemy" module
